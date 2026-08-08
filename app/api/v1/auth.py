@@ -12,7 +12,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.apple import AppleTokenValidationError, verify_apple_identity_token
-from app.auth.cognito_admin import CognitoAdminError, ensure_cognito_user, global_sign_out, refresh_tokens, sign_in_user
+from app.auth.cognito_admin import (
+    CognitoAdminError,
+    ensure_cognito_user,
+    global_sign_out,
+    refresh_tokens,
+    sign_in_user,
+)
 from app.config import Settings, get_settings
 from app.db.models.user import User
 from app.db.session import get_db
