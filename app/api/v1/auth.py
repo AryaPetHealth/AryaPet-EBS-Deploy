@@ -47,13 +47,16 @@ async def sign_in_with_apple(
     if user is None:
         cognito_username = _cognito_username_for(apple_sub)
         try:
-            await asyncio.to_thread(ensure_cognito_user, cognito_username, email=email, settings=settings)
+            cognito_sub = await asyncio.to_thread(
+                ensure_cognito_user, cognito_username, email=email, settings=settings
+            )
         except CognitoAdminError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
         user = User(
             apple_sub=apple_sub,
             cognito_username=cognito_username,
+            cognito_sub=cognito_sub,
             email=email,
             last_login_at=now,
         )

@@ -1,0 +1,51 @@
+name: CD
+
+# Runs only after CI has passed on main — kept as a separate workflow (rather than a
+# second job in ci.yml) so the app's single Elastic Beanstalk environment/instance can
+# later be swapped for a per-service deploy (e.g. API vs worker) without touching CI.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Package application
+        run: zip -r ../deploy.zip . -x '.git/*' '.github/*'
+
+      - name: Upload application bundle
+        run: |
+          aws s3 cp ../deploy.zip \
+            "s3://${{ vars.EB_DEPLOY_BUCKET }}/${{ vars.EB_APPLICATION_NAME }}/${{ github.event.workflow_run.head_sha }}.zip"
+
+      - name: Create application version
+        run: |
+          aws elasticbeanstalk create-application-version \
+            --application-name "${{ vars.EB_APPLICATION_NAME }}" \
+            --version-label "${{ github.event.workflow_run.head_sha }}" \
+            --source-bundle S3Bucket="${{ vars.EB_DEPLOY_BUCKET }}",S3Key="${{ vars.EB_APPLICATION_NAME }}/${{ github.event.workflow_run.head_sha }}.zip"
+
+      - name: Deploy application version
+        run: |
+          aws elasticbeanstalk update-environment \
+            --environment-name "${{ vars.EB_ENVIRONMENT_NAME }}" \
+            --version-label "${{ github.event.workflow_run.head_sha }}"
+
+      - name: Wait for environment to stabilize
+        run: |
+          aws elasticbeanstalk wait environment-updated \
+            --environment-names "${{ vars.EB_ENVIRONMENT_NAME }}"
