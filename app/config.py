@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     cognito_app_client_id: str
     cognito_region: str = "ap-south-1"
 
+    # Apple's Sign in with Apple identity tokens carry `aud` == the app's bundle id for
+    # native (AuthenticationServices) sign-in flows, e.g. "com.aryapet.mvp".
+    apple_bundle_id: str
+
     documents_bucket: str
 
     sqs_processing_queue_url: str
