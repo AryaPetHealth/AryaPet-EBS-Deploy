@@ -1,0 +1,89 @@
+name: Deploy to Elastic Beanstalk (dev)
+
+on:
+  workflow_dispatch: {}
+
+env:
+  AWS_REGION: ap-south-1
+  EB_APPLICATION_NAME: arya-ebstalk-dev-env
+  EB_ENVIRONMENT_NAME: arya-ebstalk-dev-env
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -e ".[dev]"
+
+      - run: ruff check app tests
+
+      - run: pytest tests/ -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_EB_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package source bundle
+        run: |
+          zip -r deploy.zip . \
+            -x ".git/*" ".github/*" ".venv/*" "**/__pycache__/*" \
+               "tests/*" ".pytest_cache/*" ".ruff_cache/*"
+
+      - name: Resolve EB's default S3 bucket
+        id: eb_bucket
+        run: |
+          BUCKET=$(aws elasticbeanstalk create-storage-location --query 'S3Bucket' --output text)
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+
+      - name: Upload source bundle
+        run: |
+          aws s3 cp deploy.zip "s3://${{ steps.eb_bucket.outputs.bucket }}/${EB_APPLICATION_NAME}/${GITHUB_SHA}.zip"
+
+      - name: Create application version
+        run: |
+          aws elasticbeanstalk create-application-version \
+            --application-name "${EB_APPLICATION_NAME}" \
+            --version-label "${GITHUB_SHA}" \
+            --source-bundle S3Bucket="${{ steps.eb_bucket.outputs.bucket }}",S3Key="${EB_APPLICATION_NAME}/${GITHUB_SHA}.zip" \
+            --region "${AWS_REGION}"
+
+      - name: Deploy application version
+        run: |
+          aws elasticbeanstalk update-environment \
+            --environment-name "${EB_ENVIRONMENT_NAME}" \
+            --version-label "${GITHUB_SHA}" \
+            --region "${AWS_REGION}"
+
+      - name: Wait for environment update to finish
+        run: |
+          aws elasticbeanstalk wait environment-updated \
+            --environment-names "${EB_ENVIRONMENT_NAME}" \
+            --region "${AWS_REGION}"
+
+      - name: Verify environment health
+        run: |
+          STATUS=$(aws elasticbeanstalk describe-environments \
+            --environment-names "${EB_ENVIRONMENT_NAME}" \
+            --region "${AWS_REGION}" \
+            --query 'Environments[0].Health' --output text)
+          echo "Environment health: $STATUS"
+          if [ "$STATUS" != "Green" ] && [ "$STATUS" != "Ok" ]; then
+            echo "::error::Environment health is $STATUS after deploy"
+            exit 1
+          fi
