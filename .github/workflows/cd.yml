@@ -9,7 +9,6 @@ on:
     types: [completed]
     branches: [main]
 
-    
 jobs:
   deploy:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
@@ -34,11 +33,24 @@ jobs:
             "s3://${{ vars.EB_DEPLOY_BUCKET }}/${{ vars.EB_APPLICATION_NAME }}/${{ github.event.workflow_run.head_sha }}.zip"
 
       - name: Create application version
+        # Idempotent: re-running this job for a commit whose version was already
+        # created (e.g. retrying after a later step failed) would otherwise fail with
+        # "Application Version ... already exists".
         run: |
-          aws elasticbeanstalk create-application-version \
+          VERSION_LABEL="${{ github.event.workflow_run.head_sha }}"
+          EXISTING=$(aws elasticbeanstalk describe-application-versions \
             --application-name "${{ vars.EB_APPLICATION_NAME }}" \
-            --version-label "${{ github.event.workflow_run.head_sha }}" \
-            --source-bundle S3Bucket="${{ vars.EB_DEPLOY_BUCKET }}",S3Key="${{ vars.EB_APPLICATION_NAME }}/${{ github.event.workflow_run.head_sha }}.zip"
+            --version-labels "$VERSION_LABEL" \
+            --query "ApplicationVersions[0].VersionLabel" --output text)
+
+          if [ "$EXISTING" = "$VERSION_LABEL" ]; then
+            echo "Application version $VERSION_LABEL already exists, skipping creation."
+          else
+            aws elasticbeanstalk create-application-version \
+              --application-name "${{ vars.EB_APPLICATION_NAME }}" \
+              --version-label "$VERSION_LABEL" \
+              --source-bundle S3Bucket="${{ vars.EB_DEPLOY_BUCKET }}",S3Key="${{ vars.EB_APPLICATION_NAME }}/$VERSION_LABEL.zip"
+          fi
 
       - name: Deploy application version
         run: |
