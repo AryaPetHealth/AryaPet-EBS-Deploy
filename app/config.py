@@ -38,7 +38,8 @@ class Settings(BaseSettings):
     sqs_processing_queue_url: str
     sqs_processing_dlq_url: str | None = None
 
-    sns_platform_application_arn: str | None = None
+    # EB environment sets this as SNS_APNS_PLATFORM_APP_ARN.
+    sns_platform_application_arn: str | None = Field(None, validation_alias="SNS_APNS_PLATFORM_APP_ARN")
 
 
 @lru_cache
