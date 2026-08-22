@@ -9,6 +9,16 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+# arya-ebstalk-dev-env is a SingleInstance environment - it can only apply one
+# update-environment call at a time. Without this, two deploys triggered close
+# together (e.g. two quick pushes to main) race and one gets aborted mid-deploy,
+# leaving the instance on neither version cleanly. Queue instead of racing or
+# cancelling - cancelling the workflow run wouldn't stop the AWS-side update that's
+# already in flight, so cancel-in-progress would just recreate the same race.
+concurrency:
+  group: deploy-eb-dev
+  cancel-in-progress: false
+
 env:
   AWS_REGION: ap-south-1
   EB_APPLICATION_NAME: arya-ebstalk-dev
