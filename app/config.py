@@ -2,6 +2,7 @@ import json
 from functools import lru_cache
 
 import boto3
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,8 +12,10 @@ class Settings(BaseSettings):
     environment: str = "dev"
     aws_region: str = "ap-south-1"
 
-    # Secrets Manager secret holding RDS credentials (JSON: username, password, host, port, dbname, engine)
-    db_secret_name: str = "arya/rds-dev"
+    # Secrets Manager secret holding RDS credentials (JSON: username, password, host, port, dbname, engine).
+    # Accepts either a friendly secret name or a full ARN (both are valid SecretId values), since the EB
+    # environment sets this as DB_SECRET_ARN.
+    db_secret_name: str = Field("arya/rds-dev", validation_alias="DB_SECRET_ARN")
 
     # Optional direct override, e.g. for local dev without AWS access. When unset, the DB
     # URL is built from the Secrets Manager secret above.
@@ -25,7 +28,12 @@ class Settings(BaseSettings):
     cognito_app_client_id: str
     cognito_region: str = "ap-south-1"
 
-    documents_bucket: str
+    # Apple's Sign in with Apple identity tokens carry `aud` == the app's bundle id for
+    # native (AuthenticationServices) sign-in flows, e.g. "com.aryapet.mvp".
+    apple_bundle_id: str
+
+    # EB environment sets this as S3_DOCUMENTS_BUCKET.
+    documents_bucket: str = Field(validation_alias="S3_DOCUMENTS_BUCKET")
 
     sqs_processing_queue_url: str
     sqs_processing_dlq_url: str | None = None

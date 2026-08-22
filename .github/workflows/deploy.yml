@@ -1,6 +1,12 @@
 name: Deploy to Elastic Beanstalk (dev)
 
+# Auto-deploys once CI has passed on main. workflow_dispatch is kept as a manual
+# fallback (e.g. re-deploying the current main commit without a new push).
 on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch: {}
 
 env:
@@ -9,35 +15,26 @@ env:
   EB_ENVIRONMENT_NAME: arya-ebstalk-dev-env
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - run: pip install -e ".[dev]"
-
-      - run: ruff check app tests
-
-      - run: pytest tests/ -q
-
   deploy:
-    needs: test
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_EB_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve deploy version label
+        id: version
+        run: echo "label=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_OUTPUT"
 
       - name: Package source bundle
         run: |
@@ -53,21 +50,35 @@ jobs:
 
       - name: Upload source bundle
         run: |
-          aws s3 cp deploy.zip "s3://${{ steps.eb_bucket.outputs.bucket }}/${EB_APPLICATION_NAME}/${GITHUB_SHA}.zip"
+          aws s3 cp deploy.zip \
+            "s3://${{ steps.eb_bucket.outputs.bucket }}/${EB_APPLICATION_NAME}/${{ steps.version.outputs.label }}.zip"
 
       - name: Create application version
+        # Idempotent: re-running for a commit whose version already exists (e.g. a manual
+        # re-dispatch after a later step failed) would otherwise fail with "Application
+        # Version ... already exists".
         run: |
-          aws elasticbeanstalk create-application-version \
+          VERSION_LABEL="${{ steps.version.outputs.label }}"
+          EXISTING=$(aws elasticbeanstalk describe-application-versions \
             --application-name "${EB_APPLICATION_NAME}" \
-            --version-label "${GITHUB_SHA}" \
-            --source-bundle S3Bucket="${{ steps.eb_bucket.outputs.bucket }}",S3Key="${EB_APPLICATION_NAME}/${GITHUB_SHA}.zip" \
-            --region "${AWS_REGION}"
+            --version-labels "$VERSION_LABEL" \
+            --query "ApplicationVersions[0].VersionLabel" --output text)
+
+          if [ "$EXISTING" = "$VERSION_LABEL" ]; then
+            echo "Application version $VERSION_LABEL already exists, skipping creation."
+          else
+            aws elasticbeanstalk create-application-version \
+              --application-name "${EB_APPLICATION_NAME}" \
+              --version-label "$VERSION_LABEL" \
+              --source-bundle S3Bucket="${{ steps.eb_bucket.outputs.bucket }}",S3Key="${EB_APPLICATION_NAME}/$VERSION_LABEL.zip" \
+              --region "${AWS_REGION}"
+          fi
 
       - name: Deploy application version
         run: |
           aws elasticbeanstalk update-environment \
             --environment-name "${EB_ENVIRONMENT_NAME}" \
-            --version-label "${GITHUB_SHA}" \
+            --version-label "${{ steps.version.outputs.label }}" \
             --region "${AWS_REGION}"
 
       - name: Wait for environment update to finish
