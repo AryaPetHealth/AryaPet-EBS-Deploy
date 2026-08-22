@@ -1,6 +1,7 @@
 import uuid
 
 import boto3
+from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,7 +12,12 @@ from app.db.models.document import Document
 from app.db.models.pet import Pet
 from app.db.models.user import User
 from app.db.session import get_db
-from app.schemas.document import DocumentRead, PresignedUploadRequest, PresignedUploadResponse
+from app.schemas.document import (
+    DocumentRead,
+    DocumentUploadStatus,
+    PresignedUploadRequest,
+    PresignedUploadResponse,
+)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -73,6 +79,34 @@ async def get_document(
     db: AsyncSession = Depends(get_db),
 ) -> Document:
     return await _get_owned_document(document_id, current_user, db)
+
+
+@router.get("/{document_id}/upload-status", response_model=DocumentUploadStatus)
+async def get_upload_status(
+    document_id: uuid.UUID,
+    current_user: CurrentDbUser,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> DocumentUploadStatus:
+    # The Document row is created when the presigned URL is issued, before the client has
+    # actually PUT the file to S3 — so the DB alone can't say whether the upload happened.
+    # This checks the bucket directly.
+    document = await _get_owned_document(document_id, current_user, db)
+
+    s3_client = boto3.client("s3", region_name=settings.aws_region)
+    try:
+        head = s3_client.head_object(Bucket=settings.documents_bucket, Key=document.s3_key)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+            return DocumentUploadStatus(document_id=document.id, uploaded=False)
+        raise
+
+    return DocumentUploadStatus(
+        document_id=document.id,
+        uploaded=True,
+        size_bytes=head.get("ContentLength"),
+        content_type=head.get("ContentType"),
+    )
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)

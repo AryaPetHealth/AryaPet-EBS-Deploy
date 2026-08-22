@@ -28,3 +28,10 @@ class DocumentRead(BaseModel):
     failure_reason: str | None
     uploaded_at: datetime
     processed_at: datetime | None
+
+
+class DocumentUploadStatus(BaseModel):
+    document_id: uuid.UUID
+    uploaded: bool
+    size_bytes: int | None = None
+    content_type: str | None = None
