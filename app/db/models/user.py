@@ -15,8 +15,13 @@ class User(Base):
 
     # Stable per-user identifier from Apple's identity token `sub` claim. Unique per
     # (Apple Developer Team ID + Services ID/Bundle ID), so it's stable across sign-ins
-    # for this app but not shared with other apps.
-    apple_sub: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    # for this app but not shared with other apps. Nullable: a user who signed up via
+    # Google has no Apple identity at all. Exactly one of apple_sub/google_sub is set.
+    apple_sub: Mapped[str | None] = mapped_column(String(255), unique=True, index=True, nullable=True)
+
+    # Stable per-user identifier from Google's identity token `sub` claim. Nullable for
+    # the same reason as apple_sub above, in reverse.
+    google_sub: Mapped[str | None] = mapped_column(String(255), unique=True, index=True, nullable=True)
 
     # Cognito username we mint for this user (see app/auth/cognito_admin.py) — not
     # user-facing, just the key used to drive AdminInitiateAuth.

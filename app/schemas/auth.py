@@ -9,6 +9,11 @@ class AppleSignInRequest(BaseModel):
     identity_token: str
 
 
+class GoogleSignInRequest(BaseModel):
+    # The ID token from the native Google Sign-In SDK (a JWT).
+    identity_token: str
+
+
 class TokenResponse(BaseModel):
     id_token: str
     access_token: str

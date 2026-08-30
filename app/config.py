@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     # native (AuthenticationServices) sign-in flows, e.g. "com.aryapet.mvp".
     apple_bundle_id: str
 
+    # Google's identity tokens carry `aud` == this OAuth client id. Optional (unlike
+    # apple_bundle_id) so a missing value fails only the /v1/auth/google route at
+    # request time, not Settings() validation for the whole app - the deploy incident
+    # from a missing *required* var here should not repeat for an optional feature.
+    google_client_id: str | None = Field(None, validation_alias="GOOGLE_CLIENT_ID")
+
     # EB environment sets this as S3_DOCUMENTS_BUCKET.
     documents_bucket: str = Field(validation_alias="S3_DOCUMENTS_BUCKET")
 

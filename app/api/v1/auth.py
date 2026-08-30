@@ -19,16 +19,28 @@ from app.auth.cognito_admin import (
     refresh_tokens,
     sign_in_user,
 )
+from app.auth.google import GoogleTokenValidationError, verify_google_identity_token
 from app.config import Settings, get_settings
 from app.db.models.user import User
 from app.db.session import get_db
-from app.schemas.auth import AppleSignInRequest, LogoutRequest, RefreshRequest, RefreshResponse, TokenResponse
+from app.schemas.auth import (
+    AppleSignInRequest,
+    GoogleSignInRequest,
+    LogoutRequest,
+    RefreshRequest,
+    RefreshResponse,
+    TokenResponse,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _cognito_username_for(apple_sub: str) -> str:
     return f"apple_{apple_sub}"
+
+
+def _cognito_username_for_google(google_sub: str) -> str:
+    return f"google_{google_sub}"
 
 
 @router.post("/apple", response_model=TokenResponse)
@@ -73,6 +85,66 @@ async def sign_in_with_apple(
         if email and not user.email:
             # Apple only sends email on the very first sign-in; capture it if we
             # somehow missed it (e.g. the row was created before this field existed).
+            user.email = email
+
+    try:
+        tokens = await asyncio.to_thread(sign_in_user, user.cognito_username, settings)
+    except CognitoAdminError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    await db.commit()
+
+    return TokenResponse(
+        id_token=tokens.id_token,
+        access_token=tokens.access_token,
+        refresh_token=tokens.refresh_token,
+        expires_in=tokens.expires_in,
+        user_id=user.id,
+        is_new_user=is_new_user,
+    )
+
+
+@router.post("/google", response_model=TokenResponse)
+async def sign_in_with_google(
+    payload: GoogleSignInRequest,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> TokenResponse:
+    try:
+        claims = await verify_google_identity_token(payload.identity_token, settings)
+    except GoogleTokenValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+
+    google_sub = claims["sub"]
+    email = claims.get("email")
+    now = datetime.now(UTC)
+
+    result = await db.execute(select(User).where(User.google_sub == google_sub))
+    user = result.scalar_one_or_none()
+    is_new_user = user is None
+
+    if user is None:
+        cognito_username = _cognito_username_for_google(google_sub)
+        try:
+            cognito_sub = await asyncio.to_thread(
+                ensure_cognito_user, cognito_username, email=email, settings=settings
+            )
+        except CognitoAdminError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+        user = User(
+            google_sub=google_sub,
+            cognito_username=cognito_username,
+            cognito_sub=cognito_sub,
+            email=email,
+            last_login_at=now,
+        )
+        db.add(user)
+        await db.flush()  # assigns user.id without committing yet
+    else:
+        user.last_login_at = now
+        if email and not user.email:
             user.email = email
 
     try:
