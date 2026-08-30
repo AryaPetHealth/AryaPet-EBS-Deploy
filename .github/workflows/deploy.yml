@@ -108,3 +108,62 @@ jobs:
             echo "::error::Environment health is $STATUS after deploy"
             exit 1
           fi
+
+          # EB's self-reported Health can read Green just as the container comes up,
+          # before it's actually accepting requests. Confirm with a real request
+          # instead of trusting the platform's status alone.
+          CNAME=$(aws elasticbeanstalk describe-environments \
+            --environment-names "${EB_ENVIRONMENT_NAME}" \
+            --region "${AWS_REGION}" \
+            --query 'Environments[0].CNAME' --output text)
+
+          for i in 1 2 3 4 5; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://${CNAME}/health" || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "GET /health -> 200"
+              exit 0
+            fi
+            echo "GET /health -> $CODE, retrying ($i/5)..."
+            sleep 10
+          done
+          echo "::error::/health did not return 200 after deploy"
+          exit 1
+
+      - name: Dump diagnostics on failure
+        # Mirrors the manual triage steps needed to root-cause a bad deploy: instance
+        # health causes, recent environment events, and the crashed container's actual
+        # stdout/stderr (CloudWatch log streaming can lag or stop entirely once
+        # eb-docker/nginx die, so pull the tail logs directly instead of relying on it).
+        if: failure()
+        run: |
+          echo "::group::Instance health causes"
+          aws elasticbeanstalk describe-instances-health \
+            --environment-name "${EB_ENVIRONMENT_NAME}" \
+            --region "${AWS_REGION}" \
+            --attribute-names All \
+            --query 'InstanceHealthList[0].{Status:HealthStatus,Causes:Causes,Deployment:Deployment}' \
+            --output json || true
+          echo "::endgroup::"
+
+          echo "::group::Recent environment events"
+          aws elasticbeanstalk describe-events \
+            --environment-name "${EB_ENVIRONMENT_NAME}" \
+            --region "${AWS_REGION}" \
+            --max-items 20 \
+            --query 'Events[].{Time:EventDate,Severity:Severity,Message:Message}' \
+            --output table || true
+          echo "::endgroup::"
+
+          echo "::group::Instance tail logs"
+          aws elasticbeanstalk request-environment-info \
+            --environment-name "${EB_ENVIRONMENT_NAME}" \
+            --info-type tail \
+            --region "${AWS_REGION}" || true
+          sleep 20
+          URL=$(aws elasticbeanstalk retrieve-environment-info \
+            --environment-name "${EB_ENVIRONMENT_NAME}" \
+            --info-type tail \
+            --region "${AWS_REGION}" \
+            --query 'EnvironmentInfo[0].Message' --output text || true)
+          [ -n "$URL" ] && [ "$URL" != "None" ] && curl -s "$URL" || echo "Could not retrieve tail logs"
+          echo "::endgroup::"
