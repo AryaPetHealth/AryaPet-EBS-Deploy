@@ -36,11 +36,17 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _cognito_username_for(apple_sub: str) -> str:
-    return f"apple_{apple_sub}"
+    # This User Pool has "Username attributes" set to email, so AdminCreateUser
+    # rejects any username that isn't email-shaped - a synthetic-but-validly-formatted
+    # one, not a real deliverable address. Never used for actual email delivery: user
+    # creation uses MessageAction=SUPPRESS and login goes through ADMIN_USER_PASSWORD_AUTH
+    # with a backend-generated password (see cognito_admin.py), not anything
+    # email-dependent like invites or password reset.
+    return f"apple-{apple_sub}@users.aryapet.internal"
 
 
 def _cognito_username_for_google(google_sub: str) -> str:
-    return f"google_{google_sub}"
+    return f"google-{google_sub}@users.aryapet.internal"
 
 
 @router.post("/apple", response_model=TokenResponse)
