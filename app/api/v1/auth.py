@@ -72,7 +72,7 @@ async def sign_in_with_apple(
         cognito_username = _cognito_username_for(apple_sub)
         try:
             cognito_sub = await asyncio.to_thread(
-                ensure_cognito_user, cognito_username, email=email, settings=settings
+                ensure_cognito_user, cognito_username, settings=settings
             )
         except CognitoAdminError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
@@ -134,7 +134,7 @@ async def sign_in_with_google(
         cognito_username = _cognito_username_for_google(google_sub)
         try:
             cognito_sub = await asyncio.to_thread(
-                ensure_cognito_user, cognito_username, email=email, settings=settings
+                ensure_cognito_user, cognito_username, settings=settings
             )
         except CognitoAdminError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
