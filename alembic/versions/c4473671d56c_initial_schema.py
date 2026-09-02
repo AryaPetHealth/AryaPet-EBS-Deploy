@@ -50,10 +50,13 @@ def upgrade() -> None:
     )
     op.create_index("ix_pets_owner_id", "pets", ["owner_id"])
 
+    # Not created explicitly here: op.create_table below creates it automatically
+    # since it's used as the "status" column's type. An explicit .create() call
+    # here caused a duplicate CREATE TYPE (create_table creates the enum too),
+    # so this migration would fail with DuplicateObjectError on a fresh database.
     document_status = postgresql.ENUM(
         "pending", "processing", "completed", "failed", name="document_status"
     )
-    document_status.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
         "documents",

@@ -32,7 +32,13 @@ class Document(Base):
     s3_key: Mapped[str] = mapped_column(String(1024), unique=True, nullable=False)
 
     status: Mapped[DocumentStatus] = mapped_column(
-        SAEnum(DocumentStatus, name="document_status"), default=DocumentStatus.PENDING, nullable=False
+        # values_callable: SAEnum defaults to persisting the Python enum member's *name*
+        # ("PENDING"), but the actual Postgres enum type only has the lowercase *values*
+        # ("pending", ...) from the original migration - without this it fails with
+        # InvalidTextRepresentationError on every insert.
+        SAEnum(DocumentStatus, name="document_status", values_callable=lambda enum_cls: [e.value for e in enum_cls]),
+        default=DocumentStatus.PENDING,
+        nullable=False,
     )
 
     # Structured Textract output once parsed (see app/services/textract_parser.py).

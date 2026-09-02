@@ -74,13 +74,19 @@ def _extract_sub(attributes: list[dict[str, str]]) -> str:
     raise CognitoAdminError("Cognito user has no sub attribute")
 
 
-def ensure_cognito_user(username: str, *, email: str | None, settings: Settings) -> str:
+def ensure_cognito_user(username: str, *, settings: Settings) -> str:
     """Creates the Cognito user if they don't already exist. Idempotent. Returns
     Cognito's own internal user id (the `sub` claim value) either way."""
     client = _client(settings)
-    user_attributes = [{"Name": "email_verified", "Value": "true"}]
-    if email:
-        user_attributes.append({"Name": "email", "Value": email})
+    # This User Pool has Username attributes = email, which means Cognito requires
+    # the "email" user attribute to either be omitted or exactly equal the username -
+    # it can't hold the real Apple/Google email (that's already stored in our own
+    # users table; Cognito never needs it, since login is backend-controlled
+    # ADMIN_USER_PASSWORD_AUTH, not anything email-dependent like invites or resets).
+    user_attributes = [
+        {"Name": "email", "Value": username},
+        {"Name": "email_verified", "Value": "true"},
+    ]
 
     try:
         response = client.admin_create_user(

@@ -20,12 +20,14 @@ from app.auth.cognito_admin import (
     sign_in_user,
 )
 from app.auth.dev_token import mint_dev_token
+from app.auth.google import GoogleTokenValidationError, verify_google_identity_token
 from app.config import Settings, get_settings
 from app.db.models.user import User
 from app.db.session import get_db
 from app.schemas.auth import (
     AppleSignInRequest,
     DevTokenRequest,
+    GoogleSignInRequest,
     LogoutRequest,
     RefreshRequest,
     RefreshResponse,
@@ -36,7 +38,17 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _cognito_username_for(apple_sub: str) -> str:
-    return f"apple_{apple_sub}"
+    # This User Pool has "Username attributes" set to email, so AdminCreateUser
+    # rejects any username that isn't email-shaped - a synthetic-but-validly-formatted
+    # one, not a real deliverable address. Never used for actual email delivery: user
+    # creation uses MessageAction=SUPPRESS and login goes through ADMIN_USER_PASSWORD_AUTH
+    # with a backend-generated password (see cognito_admin.py), not anything
+    # email-dependent like invites or password reset.
+    return f"apple-{apple_sub}@users.aryapet.internal"
+
+
+def _cognito_username_for_google(google_sub: str) -> str:
+    return f"google-{google_sub}@users.aryapet.internal"
 
 
 @router.post("/apple", response_model=TokenResponse)
@@ -62,7 +74,7 @@ async def sign_in_with_apple(
         cognito_username = _cognito_username_for(apple_sub)
         try:
             cognito_sub = await asyncio.to_thread(
-                ensure_cognito_user, cognito_username, email=email, settings=settings
+                ensure_cognito_user, cognito_username, settings=settings
             )
         except CognitoAdminError as exc:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
@@ -101,6 +113,66 @@ async def sign_in_with_apple(
     )
 
 
+@router.post("/google", response_model=TokenResponse)
+async def sign_in_with_google(
+    payload: GoogleSignInRequest,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> TokenResponse:
+    try:
+        claims = await verify_google_identity_token(payload.identity_token, settings)
+    except GoogleTokenValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+
+    google_sub = claims["sub"]
+    email = claims.get("email")
+    now = datetime.now(UTC)
+
+    result = await db.execute(select(User).where(User.google_sub == google_sub))
+    user = result.scalar_one_or_none()
+    is_new_user = user is None
+
+    if user is None:
+        cognito_username = _cognito_username_for_google(google_sub)
+        try:
+            cognito_sub = await asyncio.to_thread(
+                ensure_cognito_user, cognito_username, settings=settings
+            )
+        except CognitoAdminError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+        user = User(
+            google_sub=google_sub,
+            cognito_username=cognito_username,
+            cognito_sub=cognito_sub,
+            email=email,
+            last_login_at=now,
+        )
+        db.add(user)
+        await db.flush()  # assigns user.id without committing yet
+    else:
+        user.last_login_at = now
+        if email and not user.email:
+            user.email = email
+
+    try:
+        tokens = await asyncio.to_thread(sign_in_user, user.cognito_username, settings)
+    except CognitoAdminError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    await db.commit()
+
+    return TokenResponse(
+        id_token=tokens.id_token,
+        access_token=tokens.access_token,
+        refresh_token=tokens.refresh_token,
+        expires_in=tokens.expires_in,
+        user_id=user.id,
+        is_new_user=is_new_user,
+    )
+
+
 @router.post("/dev-token", response_model=TokenResponse)
 async def issue_dev_token(
     payload: DevTokenRequest,
@@ -108,8 +180,8 @@ async def issue_dev_token(
     settings: Settings = Depends(get_settings),
 ) -> TokenResponse:
     """Mints a self-signed bearer token for a dev/test user, bypassing Cognito and
-    Apple entirely — for pasting into Swagger's Authorize button. Disabled unless
-    DEV_AUTH_ENABLED is set (never in prod); see app/auth/dev_token.py."""
+    Apple/Google entirely — for pasting into Swagger's Authorize button. Disabled
+    unless DEV_AUTH_ENABLED is set (never in prod); see app/auth/dev_token.py."""
     if not settings.dev_auth_enabled:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
@@ -121,8 +193,9 @@ async def issue_dev_token(
     is_new_user = user is None
 
     if user is None:
+        # Neither apple_sub nor google_sub set — a dev token has no real upstream
+        # identity, just a Cognito-shaped identifier used to look the row back up.
         user = User(
-            apple_sub=dev_sub,
             cognito_username=dev_sub,
             cognito_sub=dev_sub,
             email=payload.email,

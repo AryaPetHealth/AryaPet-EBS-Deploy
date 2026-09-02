@@ -9,6 +9,11 @@ class AppleSignInRequest(BaseModel):
     identity_token: str
 
 
+class GoogleSignInRequest(BaseModel):
+    # The ID token from the native Google Sign-In SDK (a JWT).
+    identity_token: str
+
+
 class DevTokenRequest(BaseModel):
     # Identifies a stable dev/test user across calls (e.g. "tester1") — repeated calls
     # with the same subject return tokens for the same underlying User row.
