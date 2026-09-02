@@ -1,3 +1,5 @@
+import asyncio
+import json
 import uuid
 
 import boto3
@@ -8,12 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import CurrentDbUser
 from app.config import Settings, get_settings
-from app.db.models.document import Document
+from app.db.models.document import Document, DocumentStatus
 from app.db.models.pet import Pet
 from app.db.models.user import User
 from app.db.session import get_db
 from app.schemas.document import (
     DocumentRead,
+    DocumentTextSubmission,
     DocumentUploadStatus,
     PresignedUploadRequest,
     PresignedUploadResponse,
@@ -107,6 +110,34 @@ async def get_upload_status(
         size_bytes=head.get("ContentLength"),
         content_type=head.get("ContentType"),
     )
+
+
+@router.post("/{document_id}/text", response_model=DocumentRead)
+async def submit_text(
+    document_id: uuid.UUID,
+    payload: DocumentTextSubmission,
+    current_user: CurrentDbUser,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> Document:
+    """Accepts OCR text extracted on-device by the client and queues it for
+    classification/extraction (see app/workers/processing_consumer.py). This is the
+    pipeline's only trigger - there's no server-side OCR step."""
+    document = await _get_owned_document(document_id, current_user, db)
+
+    document.raw_text = payload.text
+    document.status = DocumentStatus.PROCESSING
+    await db.commit()
+    await db.refresh(document)
+
+    sqs_client = boto3.client("sqs", region_name=settings.aws_region)
+    await asyncio.to_thread(
+        sqs_client.send_message,
+        QueueUrl=settings.sqs_processing_queue_url,
+        MessageBody=json.dumps({"document_id": str(document.id)}),
+    )
+
+    return document
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -1,120 +1,105 @@
+from unittest.mock import patch
+
 from app.services.document_classifier import (
     build_document_card,
+    build_lab_report_card,
+    build_unknown_card,
+    build_vet_visit_card,
     classify_document,
-    extract_text_and_tables,
 )
 
 
-def _line_block(block_id: str, text: str) -> dict:
-    return {"Id": block_id, "BlockType": "LINE", "Text": text}
+def _fake_classification(labels_and_scores: dict[str, float]):
+    ordered = sorted(labels_and_scores.items(), key=lambda item: item[1], reverse=True)
+
+    def _pipeline(text: str, candidate_labels: list[str]):
+        return {"labels": [label for label, _ in ordered], "scores": [score for _, score in ordered]}
+
+    return _pipeline
 
 
-def _word_block(block_id: str, text: str) -> dict:
-    return {"Id": block_id, "BlockType": "WORD", "Text": text}
+def _fake_qa(answers: dict[str, tuple[str, float]]):
+    def _pipeline(question: str, context: str):
+        answer, score = answers.get(question, ("", 0.0))
+        return {"answer": answer, "score": score}
+
+    return _pipeline
 
 
-def _cell_block(block_id: str, row: int, col: int, word_ids: list[str]) -> dict:
-    return {
-        "Id": block_id,
-        "BlockType": "CELL",
-        "RowIndex": row,
-        "ColumnIndex": col,
-        "Relationships": [{"Type": "CHILD", "Ids": word_ids}],
+def test_classify_document_returns_lab_report_above_threshold():
+    fake = _fake_classification({"lab report": 0.9, "veterinary visit note": 0.1})
+    with patch("app.services.document_classifier._classification_pipeline", return_value=fake):
+        assert classify_document("some report text") == "lab_report"
+
+
+def test_classify_document_returns_vet_visit_above_threshold():
+    fake = _fake_classification({"lab report": 0.2, "veterinary visit note": 0.8})
+    with patch("app.services.document_classifier._classification_pipeline", return_value=fake):
+        assert classify_document("some visit text") == "vet_visit"
+
+
+def test_classify_document_returns_unknown_below_confidence_threshold():
+    fake = _fake_classification({"lab report": 0.4, "veterinary visit note": 0.35})
+    with patch("app.services.document_classifier._classification_pipeline", return_value=fake):
+        assert classify_document("ambiguous text") == "unknown"
+
+
+def test_classify_document_returns_unknown_for_empty_text():
+    assert classify_document("   ") == "unknown"
+
+
+def test_build_lab_report_card_uses_qa_answers_above_threshold():
+    fake = _fake_qa(
+        {
+            "What is the collection date?": ("2026-03-01", 0.8),
+            "What test was performed?": ("WBC", 0.7),
+            "What is the result value?": ("7.2", 0.6),
+        }
+    )
+    with patch("app.services.document_classifier._qa_pipeline", return_value=fake):
+        card = build_lab_report_card("some report text")
+
+    assert card == {
+        "type": "lab_report",
+        "collection_date": "2026-03-01",
+        "test_name": "WBC",
+        "result_value": "7.2",
     }
 
 
-def _table_response(lines: list[str], rows: list[list[str]]) -> dict:
-    blocks = [_line_block(f"line-{i}", text) for i, text in enumerate(lines)]
-
-    cell_ids = []
-    word_counter = 0
-    for r, row in enumerate(rows, start=1):
-        for c, cell_text in enumerate(row, start=1):
-            word_id = f"word-{word_counter}"
-            word_counter += 1
-            blocks.append(_word_block(word_id, cell_text))
-            cell_id = f"cell-{r}-{c}"
-            cell_ids.append(cell_id)
-            blocks.append(_cell_block(cell_id, r, c, [word_id]))
-
-    blocks.append(
-        {"Id": "table-1", "BlockType": "TABLE", "Relationships": [{"Type": "CHILD", "Ids": cell_ids}]}
+def test_build_vet_visit_card_drops_low_confidence_answers():
+    fake = _fake_qa(
+        {
+            "What is the visit date?": ("March 14, 2026", 0.9),
+            "What is the name of the clinic?": ("Bayfront Vet Clinic", 0.85),
+            "What is the diagnosis?": ("mild soft tissue strain", 0.75),
+            "What is the treatment plan?": ("irrelevant guess", 0.02),
+        }
     )
-    return {"Blocks": blocks}
+    with patch("app.services.document_classifier._qa_pipeline", return_value=fake):
+        card = build_vet_visit_card("some visit text")
+
+    assert card["visit_date"] == "March 14, 2026"
+    assert card["clinic_name"] == "Bayfront Vet Clinic"
+    assert card["diagnosis"] == "mild soft tissue strain"
+    assert card["treatment_plan"] is None
 
 
-def test_extract_text_and_tables_reads_lines_and_table_cells():
-    response = _table_response(
-        lines=["Specimen: Blood", "Reference Range noted below"],
-        rows=[["Test", "Result", "Units", "Reference Range"], ["WBC", "7.2", "10^9/L", "6.0-17.0"]],
-    )
-
-    text, tables = extract_text_and_tables(response)
-
-    assert "Specimen: Blood" in text
-    assert len(tables) == 1
-    assert tables[0][1] == ["WBC", "7.2", "10^9/L", "6.0-17.0"]
+def test_build_unknown_card_keeps_raw_text():
+    assert build_unknown_card("nothing medical here") == {
+        "type": "unknown",
+        "raw_text": "nothing medical here",
+    }
 
 
-def test_classify_document_detects_lab_report_from_table_and_keywords():
-    response = _table_response(
-        lines=["Specimen: Blood", "Reference Range noted below"],
-        rows=[["Test", "Result", "Units", "Reference Range"], ["WBC", "7.2", "10^9/L", "6.0-17.0"]],
-    )
-    text, tables = extract_text_and_tables(response)
-
-    assert classify_document(text, tables) == "lab_report"
-
-
-def test_classify_document_detects_vet_visit_from_keywords_without_tables():
-    text = (
-        "Presenting complaint: limping on left hind leg.\n"
-        "Diagnosis: mild soft tissue strain.\n"
-        "Treatment plan: rest for two weeks and anti-inflammatory medication.\n"
-        "Seen at Bayfront Vet Clinic on 03/14/2026 by Dr. Smith."
-    )
-
-    assert classify_document(text, []) == "vet_visit"
-
-
-def test_classify_document_falls_back_to_unknown():
-    assert classify_document("Just a random note with no medical content.", []) == "unknown"
-
-
-def test_build_document_card_for_lab_report():
-    response = _table_response(
-        lines=["Specimen collected 2026-03-01", "Reference Range noted below"],
-        rows=[["Test", "Result", "Units", "Reference Range"], ["WBC", "7.2", "10^9/L", "6.0-17.0"]],
-    )
-    text, tables = extract_text_and_tables(response)
-
-    card = build_document_card(text, tables)
+def test_build_document_card_dispatches_on_classification():
+    classify_fake = _fake_classification({"lab report": 0.9, "veterinary visit note": 0.1})
+    qa_fake = _fake_qa({"What is the collection date?": ("2026-03-01", 0.8)})
+    with (
+        patch("app.services.document_classifier._classification_pipeline", return_value=classify_fake),
+        patch("app.services.document_classifier._qa_pipeline", return_value=qa_fake),
+    ):
+        card = build_document_card("some report text")
 
     assert card["type"] == "lab_report"
     assert card["collection_date"] == "2026-03-01"
-    assert card["test_results"] == [
-        {"name": "WBC", "value": "7.2", "unit": "10^9/L", "reference_range": "6.0-17.0"}
-    ]
-
-
-def test_build_document_card_for_vet_visit():
-    text = (
-        "Visit date: March 14, 2026\n"
-        "Diagnosis: mild soft tissue strain\n"
-        "Treatment plan: rest for two weeks and anti-inflammatory medication\n"
-        "Seen at Bayfront Vet Clinic."
-    )
-
-    card = build_document_card(text, [])
-
-    assert card["type"] == "vet_visit"
-    assert card["diagnosis"] == "mild soft tissue strain"
-    assert card["treatment_plan"] == "rest for two weeks and anti-inflammatory medication"
-
-
-def test_build_document_card_for_unknown_keeps_raw_text():
-    text = "Nothing medical here."
-
-    card = build_document_card(text, [])
-
-    assert card == {"type": "unknown", "raw_text": text}

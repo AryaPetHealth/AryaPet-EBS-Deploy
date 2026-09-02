@@ -35,3 +35,8 @@ class DocumentUploadStatus(BaseModel):
     uploaded: bool
     size_bytes: int | None = None
     content_type: str | None = None
+
+
+class DocumentTextSubmission(BaseModel):
+    # OCR text extracted on-device by the client - see documents.submit_text.
+    text: str

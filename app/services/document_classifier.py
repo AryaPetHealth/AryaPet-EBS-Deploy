@@ -1,170 +1,90 @@
-"""Turns a Textract analyze_document response into a structured "card" for a
-document, shaped differently depending on what kind of document it is.
+"""Classifies client-submitted OCR text and extracts a structured "card" from it,
+using self-hosted HuggingFace models (not Textract, not HF's hosted Inference API -
+see the plan this was built from for why).
 
-This is a first-pass heuristic classifier (keyword + table-shape based), not ML -
-it will misclassify or under-extract on lab report layouts and vet note styles it
-hasn't seen. If extraction quality matters more than staying AWS-native, replacing
-this with an LLM-based classify+extract pass is a reasonable upgrade path; the
-Document.parsed_result JSONB shape here would stay compatible either way.
+This is a first-pass, question-answering-based extractor, not a trained NER/table
+model - it will do reasonably well on prose (vet visit notes) since that's what QA
+models are built for, but a lab report with many distinct test rows will only get its
+most prominent result captured reliably; flattened OCR text loses the table structure
+that would be needed to reconstruct a full test panel. A table-aware model, or asking
+the client to preserve structure, is the natural next step if that accuracy matters.
+
+Models are loaded once per process (lazily, via lru_cache) since construction is
+expensive - see app/workers/processing_consumer.py, which is the only caller.
 """
 
-import re
+from functools import lru_cache
 from typing import Any, Literal
 
 DocumentType = Literal["lab_report", "vet_visit", "unknown"]
 
-_LAB_KEYWORDS = (
-    "reference range",
-    "specimen",
-    "cbc",
-    "wbc",
-    "rbc",
-    "hematology",
-    "biochemistry",
-    "test result",
-    "panel",
-)
-
-_VET_VISIT_KEYWORDS = (
-    "diagnosis",
-    "clinic",
-    "veterinarian",
-    "treatment plan",
-    "physical exam",
-    "vaccination",
-    "presenting complaint",
-)
-
-_DATE_PATTERN = re.compile(
-    r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|"
-    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4})\b",
-    re.IGNORECASE,
-)
+_CLASSIFICATION_MODEL = "MoritzLaurer/deberta-v3-base-zeroshot-v1"
+_QA_MODEL = "deepset/roberta-base-squad2"
+_CLASSIFICATION_LABELS = ("lab report", "veterinary visit note")
+_CLASSIFICATION_CONFIDENCE_THRESHOLD = 0.5
+_QA_CONFIDENCE_THRESHOLD = 0.1
 
 
-def extract_text_and_tables(textract_response: dict[str, Any]) -> tuple[str, list[list[list[str]]]]:
-    """Returns (full_text, tables) where each table is a list of rows of cell text,
-    pulled from a Textract analyze_document response's Blocks."""
-    blocks = textract_response.get("Blocks", [])
-    blocks_by_id = {b["Id"]: b for b in blocks}
+@lru_cache(maxsize=1)
+def _classification_pipeline() -> Any:
+    from transformers import pipeline
 
-    lines = [b["Text"] for b in blocks if b.get("BlockType") == "LINE" and b.get("Text")]
-    full_text = "\n".join(lines)
-
-    tables: list[list[list[str]]] = []
-    for block in blocks:
-        if block.get("BlockType") != "TABLE":
-            continue
-        cells_by_position: dict[tuple[int, int], str] = {}
-        max_row = 0
-        for rel in block.get("Relationships", []):
-            if rel.get("Type") != "CHILD":
-                continue
-            for cell_id in rel.get("Ids", []):
-                cell = blocks_by_id.get(cell_id)
-                if cell is None or cell.get("BlockType") != "CELL":
-                    continue
-                row_index = cell.get("RowIndex", 1)
-                col_index = cell.get("ColumnIndex", 1)
-                max_row = max(max_row, row_index)
-                cell_text = _cell_text(cell, blocks_by_id)
-                cells_by_position[(row_index, col_index)] = cell_text
-
-        max_col = max((c for _, c in cells_by_position), default=0)
-        table_rows = [
-            [cells_by_position.get((r, c), "") for c in range(1, max_col + 1)]
-            for r in range(1, max_row + 1)
-        ]
-        tables.append(table_rows)
-
-    return full_text, tables
+    return pipeline("zero-shot-classification", model=_CLASSIFICATION_MODEL)
 
 
-def _cell_text(cell: dict[str, Any], blocks_by_id: dict[str, Any]) -> str:
-    words = []
-    for rel in cell.get("Relationships", []):
-        if rel.get("Type") != "CHILD":
-            continue
-        for word_id in rel.get("Ids", []):
-            word = blocks_by_id.get(word_id)
-            if word is not None and word.get("Text"):
-                words.append(word["Text"])
-    return " ".join(words)
+@lru_cache(maxsize=1)
+def _qa_pipeline() -> Any:
+    from transformers import pipeline
+
+    return pipeline("question-answering", model=_QA_MODEL)
 
 
-def classify_document(text: str, tables: list[list[list[str]]]) -> DocumentType:
-    lower_text = text.lower()
-    has_lab_keyword = any(keyword in lower_text for keyword in _LAB_KEYWORDS)
-    has_vet_keyword = any(keyword in lower_text for keyword in _VET_VISIT_KEYWORDS)
+def classify_document(text: str) -> DocumentType:
+    if not text.strip():
+        return "unknown"
 
-    if tables and has_lab_keyword:
-        return "lab_report"
-    if has_vet_keyword:
-        return "vet_visit"
-    return "unknown"
+    result = _classification_pipeline()(text, candidate_labels=list(_CLASSIFICATION_LABELS))
+    top_label, top_score = result["labels"][0], result["scores"][0]
+    if top_score < _CLASSIFICATION_CONFIDENCE_THRESHOLD:
+        return "unknown"
 
-
-def _first_date(text: str) -> str | None:
-    match = _DATE_PATTERN.search(text)
-    return match.group(0) if match else None
+    return "lab_report" if top_label == "lab report" else "vet_visit"
 
 
-def build_lab_report_card(text: str, tables: list[list[list[str]]]) -> dict[str, Any]:
-    test_results: list[dict[str, str]] = []
-    for table in tables:
-        for row in table:
-            # Skip header-shaped rows and rows without at least a name + one value.
-            if len(row) < 2 or not row[0] or row[0].strip().lower() in ("test", "test name", "parameter"):
-                continue
-            name, *rest = (cell.strip() for cell in row)
-            if not name or not any(rest):
-                continue
-            test_results.append(
-                {
-                    "name": name,
-                    "value": rest[0] if len(rest) > 0 else "",
-                    "unit": rest[1] if len(rest) > 1 else "",
-                    "reference_range": rest[2] if len(rest) > 2 else "",
-                }
-            )
+def _answer(text: str, question: str) -> str | None:
+    result = _qa_pipeline()(question=question, context=text)
+    if result["score"] < _QA_CONFIDENCE_THRESHOLD:
+        return None
+    return result["answer"]
 
+
+def build_lab_report_card(text: str) -> dict[str, Any]:
     return {
         "type": "lab_report",
-        "collection_date": _first_date(text),
-        "test_results": test_results,
+        "collection_date": _answer(text, "What is the collection date?"),
+        "test_name": _answer(text, "What test was performed?"),
+        "result_value": _answer(text, "What is the result value?"),
     }
 
 
 def build_vet_visit_card(text: str) -> dict[str, Any]:
     return {
         "type": "vet_visit",
-        "visit_date": _first_date(text),
-        "diagnosis": _line_after_keyword(text, "diagnosis"),
-        "treatment_plan": (
-            _line_after_keyword(text, "treatment plan") or _line_after_keyword(text, "treatment")
-        ),
+        "visit_date": _answer(text, "What is the visit date?"),
+        "clinic_name": _answer(text, "What is the name of the clinic?"),
+        "diagnosis": _answer(text, "What is the diagnosis?"),
+        "treatment_plan": _answer(text, "What is the treatment plan?"),
     }
-
-
-def _line_after_keyword(text: str, keyword: str) -> str | None:
-    for line in text.splitlines():
-        lower_line = line.lower()
-        if keyword in lower_line:
-            idx = lower_line.index(keyword) + len(keyword)
-            remainder = line[idx:].lstrip(" :-\t")
-            if remainder:
-                return remainder
-    return None
 
 
 def build_unknown_card(text: str) -> dict[str, Any]:
     return {"type": "unknown", "raw_text": text}
 
 
-def build_document_card(text: str, tables: list[list[list[str]]]) -> dict[str, Any]:
-    document_type = classify_document(text, tables)
+def build_document_card(text: str) -> dict[str, Any]:
+    document_type = classify_document(text)
     if document_type == "lab_report":
-        return build_lab_report_card(text, tables)
+        return build_lab_report_card(text)
     if document_type == "vet_visit":
         return build_vet_visit_card(text)
     return build_unknown_card(text)

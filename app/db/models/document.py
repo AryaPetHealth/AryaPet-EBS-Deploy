@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import DateTime, ForeignKey, String, Text, func
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -41,7 +41,12 @@ class Document(Base):
         nullable=False,
     )
 
-    # Structured Textract output once parsed (see app/services/textract_parser.py).
+    # Client-submitted OCR text (extracted on-device) - the input to classification/
+    # extraction, see app/services/document_classifier.py. Null until the client calls
+    # POST /v1/documents/{id}/text.
+    raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Structured classify+extract output once processed (see app/services/document_classifier.py).
     parsed_result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 

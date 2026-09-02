@@ -14,6 +14,11 @@ dependencies = [
     "python-jose[cryptography]>=3.3",
     "httpx>=0.27",
     "boto3>=1.35",
+    # Self-hosted document classification/extraction (app/services/document_classifier.py).
+    # CPU-only torch - the worker has no GPU. See the InstanceType note in
+    # .ebextensions/environment.config for the RAM this requires.
+    "transformers>=4.44",
+    "torch>=2.4",
 ]
 
 [project.optional-dependencies]
