@@ -6,8 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY pyproject.toml ./
+# spaCy's model (en_core_web_sm) is downloaded separately from the pip package itself.
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir . supervisor
+    && pip install --no-cache-dir . supervisor \
+    && python -m spacy download en_core_web_sm
 
 COPY app ./app
 COPY alembic ./alembic
