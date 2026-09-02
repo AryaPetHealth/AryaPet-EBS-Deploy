@@ -19,10 +19,18 @@ from app.auth.cognito_admin import (
     refresh_tokens,
     sign_in_user,
 )
+from app.auth.dev_token import mint_dev_token
 from app.config import Settings, get_settings
 from app.db.models.user import User
 from app.db.session import get_db
-from app.schemas.auth import AppleSignInRequest, LogoutRequest, RefreshRequest, RefreshResponse, TokenResponse
+from app.schemas.auth import (
+    AppleSignInRequest,
+    DevTokenRequest,
+    LogoutRequest,
+    RefreshRequest,
+    RefreshResponse,
+    TokenResponse,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -88,6 +96,55 @@ async def sign_in_with_apple(
         access_token=tokens.access_token,
         refresh_token=tokens.refresh_token,
         expires_in=tokens.expires_in,
+        user_id=user.id,
+        is_new_user=is_new_user,
+    )
+
+
+@router.post("/dev-token", response_model=TokenResponse)
+async def issue_dev_token(
+    payload: DevTokenRequest,
+    db: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> TokenResponse:
+    """Mints a self-signed bearer token for a dev/test user, bypassing Cognito and
+    Apple entirely — for pasting into Swagger's Authorize button. Disabled unless
+    DEV_AUTH_ENABLED is set (never in prod); see app/auth/dev_token.py."""
+    if not settings.dev_auth_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+
+    dev_sub = f"dev_{payload.subject}"
+    now = datetime.now(UTC)
+
+    result = await db.execute(select(User).where(User.cognito_sub == dev_sub))
+    user = result.scalar_one_or_none()
+    is_new_user = user is None
+
+    if user is None:
+        user = User(
+            apple_sub=dev_sub,
+            cognito_username=dev_sub,
+            cognito_sub=dev_sub,
+            email=payload.email,
+            last_login_at=now,
+        )
+        db.add(user)
+        await db.flush()
+    else:
+        user.last_login_at = now
+
+    await db.commit()
+
+    access_token = mint_dev_token(
+        cognito_sub=dev_sub, client_id=settings.cognito_app_client_id, token_use="access"
+    )
+    id_token = mint_dev_token(cognito_sub=dev_sub, client_id=settings.cognito_app_client_id, token_use="id")
+
+    return TokenResponse(
+        id_token=id_token,
+        access_token=access_token,
+        refresh_token="dev-tokens-do-not-support-refresh",
+        expires_in=3600,
         user_id=user.id,
         is_new_user=is_new_user,
     )

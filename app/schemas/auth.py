@@ -9,6 +9,13 @@ class AppleSignInRequest(BaseModel):
     identity_token: str
 
 
+class DevTokenRequest(BaseModel):
+    # Identifies a stable dev/test user across calls (e.g. "tester1") — repeated calls
+    # with the same subject return tokens for the same underlying User row.
+    subject: str = "dev-user"
+    email: str | None = None
+
+
 class TokenResponse(BaseModel):
     id_token: str
     access_token: str

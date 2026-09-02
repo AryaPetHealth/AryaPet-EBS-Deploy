@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     cognito_app_client_id: str
     cognito_region: str = "ap-south-1"
 
+    # Enables POST /v1/auth/dev-token, which mints a self-signed bearer token (see
+    # app/auth/dev_token.py) instead of going through Cognito/Apple. Must stay false
+    # outside local/dev — never set this in the prod EB environment.
+    dev_auth_enabled: bool = Field(False, validation_alias="DEV_AUTH_ENABLED")
+
     # Apple's Sign in with Apple identity tokens carry `aud` == the app's bundle id for
     # native (AuthenticationServices) sign-in flows, e.g. "com.aryapet.mvp".
     apple_bundle_id: str

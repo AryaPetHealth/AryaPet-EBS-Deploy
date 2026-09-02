@@ -5,6 +5,7 @@ import httpx
 from jose import jwt
 from jose.exceptions import JOSEError
 
+from app.auth.dev_token import DEV_ISSUER, get_dev_jwks
 from app.config import Settings
 
 _JWKS_CACHE: dict[str, Any] = {"keys": None, "fetched_at": 0.0}
@@ -45,25 +46,36 @@ async def get_jwks(settings: Settings, *, force_refresh: bool = False) -> list[d
 async def verify_token(token: str, settings: Settings) -> dict[str, Any]:
     try:
         unverified_header = jwt.get_unverified_header(token)
+        unverified_claims = jwt.get_unverified_claims(token)
     except JOSEError as exc:
         raise TokenValidationError("Invalid token header") from exc
 
+    # Dev tokens (see app.auth.dev_token) are self-signed and only trusted when the
+    # environment has explicitly opted in — this must never be true in prod.
+    is_dev_token = settings.dev_auth_enabled and unverified_claims.get("iss") == DEV_ISSUER
     kid = unverified_header.get("kid")
-    keys = await get_jwks(settings)
+
+    if is_dev_token:
+        keys = get_dev_jwks()
+        issuer = DEV_ISSUER
+    else:
+        keys = await get_jwks(settings)
+        issuer = _issuer(settings)
+
     key = next((k for k in keys if k["kid"] == kid), None)
-    if key is None:
+    if key is None and not is_dev_token:
         # Key may have rotated; refresh the cache once and retry before giving up.
         keys = await get_jwks(settings, force_refresh=True)
         key = next((k for k in keys if k["kid"] == kid), None)
-        if key is None:
-            raise TokenValidationError("Signing key not found")
+    if key is None:
+        raise TokenValidationError("Signing key not found")
 
     try:
         claims = jwt.decode(
             token,
             key,
             algorithms=["RS256"],
-            issuer=_issuer(settings),
+            issuer=issuer,
             # Cognito access tokens carry no `aud` claim (only id tokens do); audience is
             # checked manually below against the appropriate claim for each token type.
             options={"verify_aud": False},
