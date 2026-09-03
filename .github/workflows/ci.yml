@@ -19,6 +19,8 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -e ".[dev]"
+          # spaCy's model is a separate download from the pip package (see Dockerfile).
+          python -m spacy download en_core_web_sm
 
       - name: Lint
         run: ruff check .
