@@ -84,6 +84,8 @@ async def sign_in_with_apple(
             cognito_username=cognito_username,
             cognito_sub=cognito_sub,
             email=email,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
             last_login_at=now,
         )
         db.add(user)
@@ -94,6 +96,12 @@ async def sign_in_with_apple(
             # Apple only sends email on the very first sign-in; capture it if we
             # somehow missed it (e.g. the row was created before this field existed).
             user.email = email
+        # Same one-shot rule applies to the name — only ever backfill a name the
+        # user doesn't already have, never overwrite one that's already stored.
+        if payload.first_name and not user.first_name:
+            user.first_name = payload.first_name
+        if payload.last_name and not user.last_name:
+            user.last_name = payload.last_name
 
     try:
         tokens = await asyncio.to_thread(sign_in_user, user.cognito_username, settings)
@@ -110,6 +118,9 @@ async def sign_in_with_apple(
         expires_in=tokens.expires_in,
         user_id=user.id,
         is_new_user=is_new_user,
+        email=user.email,
+        first_name=user.first_name,
+        last_name=user.last_name,
     )
 
 
@@ -146,6 +157,8 @@ async def sign_in_with_google(
             cognito_username=cognito_username,
             cognito_sub=cognito_sub,
             email=email,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
             last_login_at=now,
         )
         db.add(user)
@@ -154,6 +167,10 @@ async def sign_in_with_google(
         user.last_login_at = now
         if email and not user.email:
             user.email = email
+        if payload.first_name and not user.first_name:
+            user.first_name = payload.first_name
+        if payload.last_name and not user.last_name:
+            user.last_name = payload.last_name
 
     try:
         tokens = await asyncio.to_thread(sign_in_user, user.cognito_username, settings)
@@ -170,6 +187,9 @@ async def sign_in_with_google(
         expires_in=tokens.expires_in,
         user_id=user.id,
         is_new_user=is_new_user,
+        email=user.email,
+        first_name=user.first_name,
+        last_name=user.last_name,
     )
 
 

@@ -37,6 +37,13 @@ class User(Base):
     # private relay address) — persist it then, since it may be absent on later logins.
     email: Mapped[str | None] = mapped_column(String(320), nullable=True)
 
+    # Same one-shot caveat as email: Apple (and Google, in practice) only sends the
+    # user's name on that identity's first authorization for this app. The client
+    # captures it locally and forwards it here so it survives reinstalls and syncs
+    # to other devices instead of living only in the on-device SQLite row.
+    first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     # SNS platform endpoint ARN for push notifications (registered separately once a
     # device-registration endpoint exists). Nullable until that's built.
     sns_endpoint_arn: Mapped[str | None] = mapped_column(String(512), nullable=True)
