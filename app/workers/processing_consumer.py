@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import build_database_url, get_settings
 from app.db.models.document import Document, DocumentStatus
 from app.db.session import get_session_maker, init_engine
-from app.services.document_classifier import build_document_card
+from app.services.document_classifier import build_card_from_pdf, build_document_card
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +29,42 @@ MAX_MESSAGES = 10
 VISIBILITY_TIMEOUT = 120
 
 
+async def _fetch_pdf_bytes(s3_key: str, bucket: str, region: str) -> bytes:
+    s3 = boto3.client("s3", region_name=region)
+    response = await asyncio.to_thread(s3.get_object, Bucket=bucket, Key=s3_key)
+    return response["Body"].read()
+
+
+async def _build_card(document: Document, settings: Any) -> dict[str, Any]:
+    """Prefers the uploaded PDF's own table geometry over the flattened OCR text the
+    client submitted: the text has already lost the column positions that say which
+    value belongs to which analyte. Falls back to the text parser for photographed
+    documents (no PDF), unreadable PDFs, and anything without a recognizable table."""
+    s3_key = document.s3_key or ""
+    if s3_key.lower().endswith(".pdf"):
+        try:
+            pdf_bytes = await _fetch_pdf_bytes(
+                s3_key, settings.documents_bucket, settings.aws_region
+            )
+            card = await asyncio.to_thread(build_card_from_pdf, pdf_bytes)
+            if card is not None:
+                return card
+            logger.info("No table found in PDF for document %s; using text", document.id)
+        except Exception:
+            # A missing/corrupt object or an unparseable PDF shouldn't fail the whole
+            # document when there's still usable OCR text to fall back on.
+            logger.exception("PDF extraction failed for document %s; using text", document.id)
+
+    card = await asyncio.to_thread(build_document_card, document.raw_text or "")
+    card.setdefault("extraction", {"source": "text", "strategy": "flattened_text"})
+    return card
+
+
 async def _process_document(
     document_id: uuid.UUID,
     session_maker: async_sessionmaker[AsyncSession],
 ) -> None:
+    settings = get_settings()
     async with session_maker() as session:
         document = await session.get(Document, document_id)
         if document is None:
@@ -40,7 +72,7 @@ async def _process_document(
             return
 
         try:
-            card = build_document_card(document.raw_text or "")
+            card = await _build_card(document, settings)
         except Exception as exc:
             document.status = DocumentStatus.FAILED
             document.failure_reason = str(exc)

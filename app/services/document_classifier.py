@@ -29,6 +29,9 @@ import re
 from functools import lru_cache
 from typing import Any, Literal
 
+from app.services.analyte_gazetteer import annotate_parameters
+from app.services.pdf_table_extractor import extract_lab_sections_from_pdf
+
 DocumentType = Literal["lab_report", "vet_visit", "unknown"]
 
 _SPACY_MODEL = "en_core_web_sm"
@@ -110,8 +113,31 @@ def build_lab_report_card(text: str) -> dict[str, Any]:
     }
     sections = _extract_lab_sections(text)
     if sections:
+        for section in sections:
+            annotate_parameters(section["parameters"])
         card["sections"] = sections
     return card
+
+
+def build_card_from_pdf(pdf_bytes: bytes) -> dict[str, Any] | None:
+    """Builds a lab report card from the PDF's own table geometry instead of from
+    flattened OCR text - see app/services/pdf_table_extractor.py for why that's a
+    fundamentally better signal. Returns None when the PDF has no readable table,
+    so callers fall back to the text-based path."""
+    sections, strategy = extract_lab_sections_from_pdf(pdf_bytes)
+    if not sections:
+        return None
+
+    for section in sections:
+        annotate_parameters(section["parameters"])
+
+    return {
+        "type": "lab_report",
+        "sections": sections,
+        # Records which tier produced this so the share of documents falling through
+        # to the lossy text parser is visible in the data rather than guessed at.
+        "extraction": {"source": "pdf", "strategy": strategy},
+    }
 
 
 # ── Table-row extraction for multi-parameter lab panels ─────────────────────
@@ -134,8 +160,13 @@ _RANGE_BOUNDS_RE = re.compile(r"([\d.]+)\s*[–\-—−]\s*([\d.]+)")
 
 
 def _is_section_title(line: str) -> bool:
+    # Real section titles in these reports are printed fully capitalized
+    # ("LIVER FUNCTION TEST"); requiring that rules out ordinary prose that
+    # happens to contain one of the keywords (e.g. "...within panel.").
     return (
         len(line) > 4
+        and line == line.upper()
+        and any(c.isalpha() for c in line)
         and not line.startswith("*")
         and ":" not in line
         and not line[0].isdigit()
