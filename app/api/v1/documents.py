@@ -1,5 +1,3 @@
-import asyncio
-import json
 import uuid
 
 import boto3
@@ -10,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import CurrentDbUser
 from app.config import Settings, get_settings
-from app.db.models.document import Document, DocumentStatus
+from app.db.models.document import Document
 from app.db.models.pet import Pet
 from app.db.models.user import User
 from app.db.session import get_db
@@ -118,24 +116,22 @@ async def submit_text(
     payload: DocumentTextSubmission,
     current_user: CurrentDbUser,
     db: AsyncSession = Depends(get_db),
-    settings: Settings = Depends(get_settings),
 ) -> Document:
-    """Accepts OCR text extracted on-device by the client and queues it for
-    classification/extraction (see app/workers/processing_consumer.py). This is the
-    pipeline's only trigger - there's no server-side OCR step."""
+    """Stores OCR text extracted on-device by the client, for the worker to fall back
+    on when the uploaded file has no table it can read directly (photos, text-only
+    PDFs).
+
+    This doesn't trigger processing and doesn't touch the status. The trigger is the
+    upload itself - S3 notifies the processing queue on every object created (see
+    app/workers/processing_consumer.py). By the time this call lands, a PDF may
+    already be COMPLETED from its own table geometry, and resetting the status here
+    would leave it stuck mid-pipeline with nothing left to finish it. A photo still
+    waiting on this text is picked up when its message is redelivered."""
     document = await _get_owned_document(document_id, current_user, db)
 
     document.raw_text = payload.text
-    document.status = DocumentStatus.PROCESSING
     await db.commit()
     await db.refresh(document)
-
-    sqs_client = boto3.client("sqs", region_name=settings.aws_region)
-    await asyncio.to_thread(
-        sqs_client.send_message,
-        QueueUrl=settings.sqs_processing_queue_url,
-        MessageBody=json.dumps({"document_id": str(document.id)}),
-    )
 
     return document
 

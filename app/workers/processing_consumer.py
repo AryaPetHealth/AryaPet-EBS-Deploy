@@ -1,10 +1,24 @@
-"""Long-polls the processing SQS queue and classifies/extracts info from documents
-whose OCR text the client has already submitted (see documents.submit_text).
+"""Long-polls the processing SQS queue and classifies/extracts info from uploaded
+documents.
 
-Runs as a standalone process on the same EB SingleInstance environment as the API
-(e.g. as a second supervisord program), not inside the FastAPI event loop. Messages that
-raise are left on the queue for SQS's built-in redrive to the `-dlq` queue after
-maxReceiveCount is exceeded.
+The queue is fed by the documents bucket itself: Terraform wires an
+`s3:ObjectCreated:*` notification to it (Arya-Infra modules/storage), so a message
+arrives the moment a file lands in S3. The API has no permission to send to this
+queue and doesn't need one - uploads are the trigger.
+
+That timing suits the two kinds of document differently:
+
+  PDFs are processed straight away. Their tables are read from the file's own
+  geometry (pdf_table_extractor), which needs nothing from the client.
+
+  Photos have no geometry, only the OCR text the client submits afterwards via
+  POST /documents/{id}/text - which may not have arrived when the S3 event does.
+  Those messages are left undeleted so SQS redelivers them after the visibility
+  timeout, by which point the text is usually there. After maxReceiveCount they
+  move to the `-dlq` queue, which is where a photo whose text never came ends up.
+
+Runs as a standalone supervisord program on the same EB SingleInstance environment as
+the API, not inside the FastAPI event loop.
 """
 
 import asyncio
@@ -13,8 +27,10 @@ import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import unquote_plus
 
 import boto3
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import build_database_url, get_settings
@@ -29,17 +45,42 @@ MAX_MESSAGES = 10
 VISIBILITY_TIMEOUT = 120
 
 
+def s3_keys_from_event(body: dict[str, Any]) -> list[str]:
+    """Object keys named by an S3 event notification.
+
+    S3 URL-encodes keys in these events ("my report.pdf" arrives as
+    "my+report.pdf"), so they're decoded here to match the key stored on the
+    Document row. Returns [] for anything that isn't an object-created event,
+    including the s3:TestEvent S3 sends when the notification is first set up.
+    """
+    keys: list[str] = []
+    for record in body.get("Records") or []:
+        if not isinstance(record, dict):
+            continue
+        if record.get("eventSource") != "aws:s3":
+            continue
+        if not str(record.get("eventName", "")).startswith("ObjectCreated"):
+            continue
+        key = ((record.get("s3") or {}).get("object") or {}).get("key")
+        if key:
+            keys.append(unquote_plus(key))
+    return keys
+
+
 async def _fetch_pdf_bytes(s3_key: str, bucket: str, region: str) -> bytes:
     s3 = boto3.client("s3", region_name=region)
     response = await asyncio.to_thread(s3.get_object, Bucket=bucket, Key=s3_key)
     return response["Body"].read()
 
 
-async def _build_card(document: Document, settings: Any) -> dict[str, Any]:
-    """Prefers the uploaded PDF's own table geometry over the flattened OCR text the
-    client submitted: the text has already lost the column positions that say which
-    value belongs to which analyte. Falls back to the text parser for photographed
-    documents (no PDF), unreadable PDFs, and anything without a recognizable table."""
+async def _build_card(document: Document, settings: Any) -> dict[str, Any] | None:
+    """Prefers the uploaded PDF's own table geometry over flattened OCR text: the
+    text has already lost the column positions that say which value belongs to
+    which analyte.
+
+    Returns None when there's nothing to work from *yet* - a photo, or a PDF with
+    no recognizable table, whose OCR text the client hasn't submitted - so the
+    caller can wait for it instead of recording an empty result."""
     s3_key = document.s3_key or ""
     if s3_key.lower().endswith(".pdf"):
         try:
@@ -49,53 +90,90 @@ async def _build_card(document: Document, settings: Any) -> dict[str, Any]:
             card = await asyncio.to_thread(build_card_from_pdf, pdf_bytes)
             if card is not None:
                 return card
-            logger.info("No table found in PDF for document %s; using text", document.id)
+            logger.info("No table found in PDF for document %s", document.id)
         except Exception:
             # A missing/corrupt object or an unparseable PDF shouldn't fail the whole
-            # document when there's still usable OCR text to fall back on.
-            logger.exception("PDF extraction failed for document %s; using text", document.id)
+            # document when there may still be OCR text to fall back on.
+            logger.exception("PDF extraction failed for document %s", document.id)
 
-    card = await asyncio.to_thread(build_document_card, document.raw_text or "")
+    if not (document.raw_text or "").strip():
+        return None
+
+    card = await asyncio.to_thread(build_document_card, document.raw_text)
     card.setdefault("extraction", {"source": "text", "strategy": "flattened_text"})
     return card
 
 
 async def _process_document(
-    document_id: uuid.UUID,
-    session_maker: async_sessionmaker[AsyncSession],
-) -> None:
-    settings = get_settings()
-    async with session_maker() as session:
-        document = await session.get(Document, document_id)
-        if document is None:
-            logger.warning("No Document row found for id=%s; skipping", document_id)
-            return
+    document: Document,
+    session: AsyncSession,
+    settings: Any,
+) -> bool:
+    """Processes one document. Returns False when it should be retried later
+    because the client's OCR text hasn't arrived yet."""
+    if document.status == DocumentStatus.COMPLETED:
+        # Already done - e.g. a redelivered event, or a PDF finished before a
+        # retry fired. Reprocessing would only repeat the work.
+        return True
 
-        try:
-            card = await _build_card(document, settings)
-        except Exception as exc:
-            document.status = DocumentStatus.FAILED
-            document.failure_reason = str(exc)
-            await session.commit()
-            raise
-
-        document.status = DocumentStatus.COMPLETED
-        document.parsed_result = card
-        document.processed_at = datetime.now(UTC)
+    try:
+        card = await _build_card(document, settings)
+    except Exception as exc:
+        document.status = DocumentStatus.FAILED
+        document.failure_reason = str(exc)[:1024]
         await session.commit()
+        raise
+
+    if card is None:
+        logger.info("Document %s has no usable content yet; waiting for its text", document.id)
+        return False
+
+    document.status = DocumentStatus.COMPLETED
+    document.parsed_result = card
+    document.processed_at = datetime.now(UTC)
+    await session.commit()
+    return True
 
 
 async def handle_message(
     message: dict[str, Any],
     session_maker: async_sessionmaker[AsyncSession],
-) -> None:
+) -> bool:
+    """Returns True when the message is fully handled and can be deleted, False
+    to leave it on the queue for redelivery."""
     body = json.loads(message["Body"])
-    document_id = body.get("document_id")
-    if not document_id:
-        logger.warning("Skipping message with no document_id: %s", body)
-        return
+    settings = get_settings()
 
-    await _process_document(uuid.UUID(document_id), session_maker)
+    keys = s3_keys_from_event(body)
+    document_id = body.get("document_id")
+    if not keys and not document_id:
+        # s3:TestEvent, or something this worker doesn't understand - retrying
+        # won't make it meaningful, so let it go.
+        logger.info("Ignoring message with no document reference: %s", body.get("Event", "?"))
+        return True
+
+    all_done = True
+    async with session_maker() as session:
+        documents: list[Document] = []
+        if document_id:
+            document = await session.get(Document, uuid.UUID(document_id))
+            if document is not None:
+                documents.append(document)
+        for key in keys:
+            result = await session.execute(select(Document).where(Document.s3_key == key))
+            document = result.scalar_one_or_none()
+            if document is None:
+                # Presign creates the row before issuing the URL, so an object with
+                # no row wasn't uploaded through the API - nothing to attach it to.
+                logger.warning("No Document row for uploaded object %s; skipping", key)
+                continue
+            documents.append(document)
+
+        for document in documents:
+            if not await _process_document(document, session, settings):
+                all_done = False
+
+    return all_done
 
 
 async def run() -> None:
@@ -121,16 +199,18 @@ async def run() -> None:
 
         for message in response.get("Messages", []):
             try:
-                await handle_message(message, session_maker)
+                done = await handle_message(message, session_maker)
             except Exception:
                 logger.exception(
                     "Failed to process message %s; leaving for redrive", message.get("MessageId")
                 )
                 continue
 
-            sqs.delete_message(
-                QueueUrl=settings.sqs_processing_queue_url, ReceiptHandle=message["ReceiptHandle"]
-            )
+            if done:
+                sqs.delete_message(
+                    QueueUrl=settings.sqs_processing_queue_url,
+                    ReceiptHandle=message["ReceiptHandle"],
+                )
 
 
 if __name__ == "__main__":
